@@ -24,9 +24,16 @@
   dashboard are intentionally on the laptop side: they iterate faster
   in Python and every input they need is in the status stream.
 
+  v0.2: OLED status display (GME12864-11, SSD1306, I2C 0x3C), `disp`
+  command so the laptop can show its diagnosis on the device, BOOT-button
+  pages, median-of-3 HX711 filter, optional optical moving average (`avg`).
+  Needs libraries: "Adafruit SSD1306" (installs "Adafruit GFX" with it).
+  Set USE_OLED to 0 to build without them.
+
   Water-only test rig. Not for clinical use.
   ------------------------------------------------------------------
 */
+#define USE_OLED 1
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -34,6 +41,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#if USE_OLED
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
 
 // =================================================================
 // Pins
@@ -43,6 +55,9 @@ static const int PIN_OPT_DROP   = 34;  // ADC1_CH6, input-only, no pull-ups
 static const int PIN_OPT_BUBBLE = 35;  // ADC1_CH7, reserved for Level 3 air sensor
 static const int PIN_HX_DOUT    = 19;
 static const int PIN_HX_SCK     = 18;
+static const int PIN_OLED_SDA   = 21;
+static const int PIN_OLED_SCL   = 22;
+static const int PIN_BTN        = 0;   // on-board BOOT button: cycles display pages
 
 // =================================================================
 // Fixed tuning constants
@@ -81,8 +96,39 @@ struct Config {
   float    stabG;         // 1-s std above this (g) => weight unstable
 };
 static const uint32_t CFG_MAGIC = 0xD6170001;
+
+// What the laptop last told us to show (`disp` command). Touched only by loop().
+struct HostDisp {
+  char level[9], big[12], line2[22], qbest[9], qo[9], qw[9], rem[9], cal[9];
+  char opt, wt;
+  uint32_t rxMs;
+};
+static HostDisp hd = {};
+static const uint32_t HOST_TIMEOUT_MS = 3000;
+
+// Optical "scope" for the display: 128 points, one per 4 samples (0.5 s window).
+static const int SCOPE_N = 128;
+static uint16_t scopeBuf[SCOPE_N];
+static volatile uint16_t scopeHead = 0;
+static volatile float scopeBase = 0, scopeThr = 0;
+static volatile uint8_t avgN = 1;      // optical moving average length (1 = off), not persisted
 static Config      cfg;
 static Preferences prefs;
+
+// Result types of computeOptical()/computeWeight(). Defined up here because the
+// Arduino IDE auto-inserts function prototypes before the first function.
+struct OStats {
+  float base, noise, amp, rate, q, since;
+  uint32_t drops, nWin, longEv, spikes;
+  bool sat;
+};
+
+struct WStats {
+  bool  ok, cal, qValid, regOk;
+  int   n;
+  float span, gNow, std1, slope, slopeSE, resid;
+  int32_t raw;
+};
 
 static void setDefaults() {
   cfg.magic        = CFG_MAGIC;
@@ -160,6 +206,9 @@ static void opticalTask(void *) {
   bool     init = false, inEv = false;
   uint32_t settleUntil = millis() + OPT_BOOT_SETTLE_MS;
   uint32_t evStart = 0, lastEvEnd = 0, n = 0;
+  static float maHist[32];
+  float maSum = 0.0f; uint8_t maIdx = 0, maLen = 0, maN = 1;
+  float scopePick = 0.0f, scopeDev = -1.0f;
   TickType_t wake = xTaskGetTickCount();
 
   for (;;) {
@@ -176,6 +225,16 @@ static void opticalTask(void *) {
     int32_t acc = 0;
     for (int i = 0; i < OPT_OVERSAMPLE; i++) acc += analogRead(PIN_OPT_DROP);
     float x = (float)acc / OPT_OVERSAMPLE;
+
+    // Optional moving average (`avg n`): ~17 samples nulls 60/120 Hz mains hum.
+    uint8_t want = avgN;
+    if (want != maN) { maN = want; maSum = 0; maIdx = 0; maLen = 0; }
+    if (maN > 1) {
+      if (maLen == maN) maSum -= maHist[maIdx]; else maLen++;
+      maHist[maIdx] = x; maSum += x;
+      maIdx = (uint8_t)((maIdx + 1) % maN);
+      x = maSum / maLen;
+    }
 
     if (!init) { base = x; noise = cfg.minDelta / cfg.kSigma; init = true; }
 
@@ -215,6 +274,17 @@ static void opticalTask(void *) {
       portENTER_CRITICAL(&optMux);
       optBase = base; optNoise = noise;
       portEXIT_CRITICAL(&optMux);
+    }
+
+    // scope: keep the most deviating of every 4 samples so short drops stay visible
+    float dev = fabsf(x - base);
+    if (dev > scopeDev) { scopeDev = dev; scopePick = x; }
+    if ((n & 3) == 0) {
+      uint16_t h = scopeHead;
+      scopeBuf[h] = (uint16_t)scopePick;
+      scopeHead = (uint16_t)((h + 1) % SCOPE_N);
+      scopeBase = base; scopeThr = thr;
+      scopeDev = -1.0f;
     }
 
     uint16_t dec = rawDecim;
@@ -267,10 +337,21 @@ static bool hxRead(int32_t &out) {
   return true;
 }
 
+static int32_t median3(int32_t a, int32_t b, int32_t c) {
+  if (a > b) { int32_t t = a; a = b; b = t; }
+  if (b > c) { b = c; }
+  return a > b ? a : b;
+}
+
 static void hxTask(void *) {
+  int32_t h0 = 0, h1 = 0; int primed = 0;
   for (;;) {
-    int32_t raw;
-    if (hxRead(raw)) {
+    int32_t rawIn;
+    if (hxRead(rawIn)) {
+      // Median of the last 3 samples: one corrupt read can't knock out the weight channel.
+      int32_t raw = rawIn;
+      if (primed >= 2) raw = median3(h0, h1, rawIn); else primed++;
+      h0 = h1; h1 = rawIn;
       uint32_t now = millis();
       float g = ((float)raw - cfg.hxOffset) / cfg.hxScale;
       xSemaphoreTake(massMtx, portMAX_DELAY);
@@ -290,11 +371,6 @@ static void hxTask(void *) {
 // =================================================================
 // Derived quantities
 // =================================================================
-struct OStats {
-  float base, noise, amp, rate, q, since;
-  uint32_t drops, nWin, longEv, spikes;
-  bool sat;
-};
 
 static OStats computeOptical(uint32_t now) {
   static uint32_t ts[DROP_RING];  // static: keep 1 kB off the loop stack
@@ -339,12 +415,6 @@ static OStats computeOptical(uint32_t now) {
   return o;
 }
 
-struct WStats {
-  bool  ok, cal, qValid, regOk;
-  int   n;
-  float span, gNow, std1, slope, slopeSE, resid;
-  int32_t raw;
-};
 
 static WStats computeWeight(uint32_t now) {
   WStats w;
@@ -529,6 +599,8 @@ static void printHelp() {
   Serial.println("#   hxraw <0|1>                   print every HX711 sample");
   Serial.println("#   k <x> | mind <counts> | refr <ms> | maxev <ms>   drop detector tuning");
   Serial.println("#   win <s> | owin <s> | stab <g> | rho <g/mL>       estimator tuning");
+  Serial.println("#   avg <1-32>                    optical moving average (17 kills mains hum; 1 = off, not saved)");
+  Serial.println("#   disp L|BIG|line2|q|qo|qw|rem|cal|opt|wt   (sent by the dashboard)");
   Serial.println("#   defaults                      restore defaults (clears calibration!)");
 }
 
@@ -539,7 +611,38 @@ static bool argF(const char *a, float lo, float hi, float &out) {
   out = v; return true;
 }
 
+static void copyField(char *dst, size_t cap, const char *src, size_t len) {
+  size_t k = len < cap - 1 ? len : cap - 1;
+  memcpy(dst, src, k);
+  dst[k] = 0;
+}
+
+// disp level|BIG|line2|q_best|q_opt|q_wt|rem_ml|cal_df|opt_flag|wt_flag
+static void parseDisp(const char *p) {
+  const char *f[10]; size_t len[10]; int n = 0;
+  while (n < 10) {
+    const char *q = strchr(p, '|');
+    f[n] = p; len[n] = q ? (size_t)(q - p) : strlen(p); n++;
+    if (!q) break;
+    p = q + 1;
+  }
+  if (n < 10) { err("disp needs 10 fields"); return; }
+  copyField(hd.level, sizeof(hd.level), f[0], len[0]);
+  copyField(hd.big,   sizeof(hd.big),   f[1], len[1]);
+  copyField(hd.line2, sizeof(hd.line2), f[2], len[2]);
+  copyField(hd.qbest, sizeof(hd.qbest), f[3], len[3]);
+  copyField(hd.qo,    sizeof(hd.qo),    f[4], len[4]);
+  copyField(hd.qw,    sizeof(hd.qw),    f[5], len[5]);
+  copyField(hd.rem,   sizeof(hd.rem),   f[6], len[6]);
+  copyField(hd.cal,   sizeof(hd.cal),   f[7], len[7]);
+  hd.opt = len[8] ? f[8][0] : '?';
+  hd.wt  = len[9] ? f[9][0] : '?';
+  hd.rxMs = millis();
+  if (hd.rxMs == 0) hd.rxMs = 1;
+}
+
 static void handleCommand(char *line) {
+  if (!strncmp(line, "disp ", 5)) { parseDisp(line + 5); return; }   // before strtok: fields contain spaces
   char *cmd = strtok(line, " \t");
   if (!cmd) return;
   char *arg = strtok(NULL, " \t");
@@ -585,15 +688,163 @@ static void handleCommand(char *line) {
   else if (!strcmp(cmd, "owin"))  { if (argF(arg, 5, 60, v))       { cfg.optWinS = v; saveConfig(); printConfig(); } }
   else if (!strcmp(cmd, "stab"))  { if (argF(arg, 0.05f, 100, v))  { cfg.stabG = v; saveConfig(); printConfig(); } }
   else if (!strcmp(cmd, "raw"))   { if (argF(arg, 0, 1000, v))     { rawDecim = (uint16_t)v; } }
+  else if (!strcmp(cmd, "avg"))   { if (argF(arg, 1, 32, v))       { avgN = (uint8_t)v; msg("optical moving average set"); } }
   else if (!strcmp(cmd, "hxraw")) { if (argF(arg, 0, 1, v))        { hxRawPrint = (v != 0); } }
   else if (!strcmp(cmd, "defaults")) { setDefaults(); massClearReq = true; saveConfig(); printConfig(); }
   else { err("unknown command - type help"); }
 }
 
+
+// =================================================================
+// OLED display (GME12864-11 = 0.96" SSD1306, 128x64, I2C)
+// =================================================================
+#if USE_OLED
+static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+static bool     oledOk = false;
+static uint8_t  page = 0;                 // 0 status, 1 agreement, 2 IR scope
+static uint32_t blinkUntil = 0, lastDraw = 0, btnChangeMs = 0;
+static bool     btnPrev = true;
+
+static void oledText(int x, int y, int size, const char *t) {
+  oled.setTextSize(size);
+  oled.setCursor(x, y);
+  oled.print(t);
+}
+
+static bool hostAlive(uint32_t now) { return hd.rxMs && (now - hd.rxMs) < HOST_TIMEOUT_MS; }
+
+// Big word: size 3 (18 px/char) if it fits 7 chars, else size 2 (12 px/char).
+static void bigWord(const char *w, int y) {
+  size_t n = strlen(w);
+  if (n <= 7) oledText(0, y, 3, w);
+  else        oledText(0, y + 4, 2, w);
+}
+
+static void drawStatus(uint32_t now) {
+  char line[32];
+  oledText(0, 0, 1, "DRIPGUARD");
+  bool host = hostAlive(now);
+  if (!host) oledText(66, 0, 1, "SOLO");
+  if ((int32_t)(blinkUntil - now) > 0) oled.fillCircle(123, 3, 3, SSD1306_WHITE);
+
+  if (host) {
+    bigWord(hd.big, 12);
+    oledText(0, 40, 1, hd.line2);
+    snprintf(line, sizeof(line), "OPT %s WT %s %smL",
+             hd.opt == 'o' ? "ok" : "ERR", hd.wt == 'o' ? "ok" : (hd.wt == '~' ? "~~" : "ERR"), hd.rem);
+  } else {
+    // Standalone: only what the device knows by itself (no fusion verdicts).
+    OStats o = computeOptical(now);
+    WStats w = computeWeight(now);
+    if (o.sat)                                         { bigWord("NO IR", 12);    oledText(0, 40, 1, "optical signal lost"); }
+    else if (o.drops > 0 && isFiniteF(o.since) && o.since > 8.0f) {
+      bigWord("NO DROPS", 12);
+      snprintf(line, sizeof(line), "none for %.0f s", (double)o.since); oledText(0, 40, 1, line);
+    } else if (o.drops == 0)                           { bigWord("READY", 12);    oledText(0, 40, 1, "waiting for drops"); }
+    else {
+      snprintf(line, sizeof(line), "%.1f", (double)o.q); bigWord(line, 12);
+      oledText(0, 40, 1, "mL/min (drop count)");
+    }
+    if (!w.ok)          snprintf(line, sizeof(line), "OPT %s WT ERR", o.sat ? "ERR" : "ok");
+    else if (!w.cal)    snprintf(line, sizeof(line), "OPT %s WT uncal", o.sat ? "ERR" : "ok");
+    else                snprintf(line, sizeof(line), "OPT %s WT %.0fg", o.sat ? "ERR" : "ok", (double)w.gNow);
+  }
+  oled.drawFastHLine(0, 52, 128, SSD1306_WHITE);
+  oledText(0, 56, 1, line);
+}
+
+static void drawAgreement(uint32_t now) {
+  oledText(0, 0, 1, "FLOW mL/min");
+  if (!hostAlive(now)) { oledText(0, 24, 1, "needs the dashboard"); return; }
+  float qo = (float)atof(hd.qo), qw = (float)atof(hd.qw);
+  bool hasO = hd.qo[0] != '-', hasW = hd.qw[0] != '-';
+  float mx = fmaxf(0.1f, fmaxf(hasO ? qo : 0, hasW ? qw : 0)) * 1.15f;
+  oledText(0, 16, 1, "OPT");
+  if (hasO) oled.fillRect(24, 15, (int)(70 * fminf(qo / mx, 1.0f)), 9, SSD1306_WHITE);
+  oledText(98, 16, 1, hd.qo);
+  oledText(0, 32, 1, "WT");
+  if (hasW) oled.fillRect(24, 31, (int)(70 * fminf(qw / mx, 1.0f)), 9, SSD1306_WHITE);
+  oledText(98, 32, 1, hd.qw);
+  char line[32];
+  snprintf(line, sizeof(line), "cal %s gtt/mL", hd.cal);
+  oledText(0, 52, 1, line);
+}
+
+static void drawScope(uint32_t now) {
+  (void)now;
+  uint16_t buf[SCOPE_N];
+  uint16_t head = scopeHead;
+  for (int i = 0; i < SCOPE_N; i++) buf[i] = scopeBuf[(head + i) % SCOPE_N];
+  float base = scopeBase, thr = scopeThr;
+  float lo = base - 1.5f * thr, hi = base + 1.5f * thr;
+  for (int i = 0; i < SCOPE_N; i++) { lo = fminf(lo, buf[i]); hi = fmaxf(hi, buf[i]); }
+  if (hi - lo < 4) { hi += 2; lo -= 2; }
+  const int y0 = 10, y1 = 63;
+  auto Y = [&](float v) { return y1 - (int)((v - lo) / (hi - lo) * (y1 - y0)); };
+  char line[32];
+  float snr;
+  portENTER_CRITICAL(&optMux); snr = optNoise > 0 ? ampAvg / optNoise : 0; portEXIT_CRITICAL(&optMux);
+  snprintf(line, sizeof(line), "IR %4.0f snr %.0f", (double)base, (double)snr);
+  oledText(0, 0, 1, line);
+  for (int x = 0; x < 128; x += 4) {            // dashed threshold lines
+    oled.drawPixel(x, Y(base + thr), SSD1306_WHITE);
+    oled.drawPixel(x, Y(base - thr), SSD1306_WHITE);
+  }
+  for (int i = 1; i < SCOPE_N; i++) oled.drawLine(i - 1, Y(buf[i - 1]), i, Y(buf[i]), SSD1306_WHITE);
+}
+
+static void oledInit() {
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  Wire.setClock(400000);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  // begin() only allocates the buffer and never checks the bus, so probe for an ACK first.
+  uint8_t addr = 0;
+  const uint8_t cand[2] = {0x3C, 0x3D};
+  for (int i = 0; i < 2; i++) {
+    Wire.beginTransmission(cand[i]);
+    if (Wire.endTransmission() == 0) { addr = cand[i]; break; }
+  }
+  if (!addr) { msg("OLED not found at 0x3C/0x3D - check SDA=21 SCL=22 VCC=3.3V; continuing without display"); return; }
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, addr, true, false);
+  if (!oledOk) { msg("OLED buffer allocation failed"); return; }
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oledText(0, 0, 2, "DripGuard");
+  oledText(0, 24, 1, "water-only prototype");
+  oledText(0, 40, 1, "starting...");
+  oled.display();
+}
+
+static void oledService(uint32_t now) {
+  // BOOT button (active low), 50 ms debounce, cycles pages
+  bool b = digitalRead(PIN_BTN) == HIGH;
+  if (b != btnPrev && now - btnChangeMs > 50) {
+    btnChangeMs = now; btnPrev = b;
+    if (!b) page = (uint8_t)((page + 1) % 3);
+  }
+  if (!oledOk || now - lastDraw < 200) return;
+  lastDraw = now;
+
+  bool host = hostAlive(now);
+  bool alarm  = host && !strcmp(hd.level, "alarm");
+  bool sensor = host && !strcmp(hd.level, "sensor");
+  // Alarms and sensor faults take over every page except the scope (used during bring-up).
+  uint8_t show = ((alarm || sensor) && page != 2) ? 0 : page;
+
+  oled.clearDisplay();
+  if (show == 0)      drawStatus(now);
+  else if (show == 1) drawAgreement(now);
+  else                drawScope(now);
+  if (sensor && show == 0) oled.drawRect(0, 9, 128, 42, SSD1306_WHITE);
+  oled.invertDisplay(alarm && show == 0 && ((now / 500) % 2 == 0));   // flashing alarm
+  oled.display();                                                     // ~25 ms over I2C
+}
+#endif
+
 // =================================================================
 // Setup / loop
 // =================================================================
-static char     lineBuf[64];
+static char     lineBuf[200];
 static uint8_t  lineLen = 0;
 static uint32_t lastStatus = 0;
 static uint32_t lastHxSeqPrinted = 0;
@@ -621,7 +872,10 @@ void setup() {
   xTaskCreatePinnedToCore(opticalTask, "opt", 4096, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(hxTask,      "hx",  4096, NULL, 4, NULL, 0);
 
-  Serial.println("{\"type\":\"boot\",\"fw\":\"dripguard-0.1\"}");
+#if USE_OLED
+  oledInit();
+#endif
+  Serial.println("{\"type\":\"boot\",\"fw\":\"dripguard-0.2\"}");
   printConfig();
   Serial.println("# type 'help' for commands");
   lastStatus = millis();
@@ -651,6 +905,9 @@ void loop() {
   // Drop events (suppressed in raw mode so the plotter stays clean)
   DropEv e;
   while (xQueueReceive(dropQ, &e, 0) == pdTRUE) {
+#if USE_OLED
+    blinkUntil = millis() + 120;
+#endif
     if (!rawDecim) {
       Serial.printf("{\"type\":\"drop\",\"t\":%lu,\"amp\":%.1f,\"w\":%u}\n",
                     (unsigned long)e.t, (double)e.amp, (unsigned)e.width);
@@ -671,6 +928,10 @@ void loop() {
     if (now - lastStatus > STATUS_PERIOD_MS) lastStatus = now;  // don't burst after a stall
     if (!rawDecim) printStatus(now);
   }
+
+#if USE_OLED
+  oledService(millis());
+#endif
 
   delay(1);
 }

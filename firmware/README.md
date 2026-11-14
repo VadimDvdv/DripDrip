@@ -1,4 +1,6 @@
-# DripGuard firmware v0.1 — ESP32-DevKitC (WROOM-32UE)
+# DripGuard firmware v0.2 — ESP32-DevKitC (WROOM-32UE)
+
+The sketch is `DripDrip/DripDrip.ino` (Arduino IDE needs the folder and the `.ino` to share a name).
 
 Water-only test rig. Not for clinical use.
 
@@ -6,9 +8,9 @@ Water-only test rig. Not for clinical use.
 
 | File | Purpose |
 |---|---|
-| `DripGuard/DripGuard.ino` | Firmware (Arduino IDE: open this; PlatformIO: `pio run -t upload`) |
+| `DripDrip/DripDrip.ino` | Firmware (Arduino IDE: open this; PlatformIO: `pio run -t upload`) |
 | `platformio.ini` | PlatformIO config, `esp32dev`, monitor at 921600 |
-| `tools/dg_log.py` | Laptop logger: live line + CSV of status and every drop, sends commands |
+| `tools/dg_log.py` | Standalone logger. Superseded by the dashboard, which logs everything itself; never run both, since only one program can open the port |
 
 **Split of work:** the ESP32 does timing-critical sampling, drop detection and the two flow estimates with their quality metrics. Fusion, drop-volume auto-calibration, alerts and the dashboard run on the laptop, where they're faster to iterate. Everything they need is in the status stream.
 
@@ -20,6 +22,7 @@ Water-only test rig. Not for clinical use.
 | Bubble receiver (later) | GPIO35 (ADC1_CH7) | Reserved |
 | HX711 DT/DOUT | **GPIO19** | |
 | HX711 SCK | **GPIO18** | |
+| OLED SDA / SCL | **GPIO21 / GPIO22** | VCC on 3V3 |
 | HX711 VCC | **3V3** | **Not 5 V.** On these green boards VCC also sets the DOUT logic level, and 5 V logic into the ESP32 can damage it |
 | HX711 GND, receiver GND, LED cathode side | GND | Common ground |
 | IR LED anode | 5V via **150 Ω** | ≈25 mA, steady. Don't drive it from a GPIO |
@@ -32,6 +35,27 @@ Load cell → HX711 (usual colors): Red E+, Black E−, White A−, Green A+. If
 - **Phototransistor** (OL both ways): collector to 3V3, emitter to GPIO34, 10–47 kΩ from emitter to GND.
 
 **Target:** with the LED on and no drop, `o_base` should be 800–3000 counts. If it's near 0 or `o_sat=1`, change the resistor, the alignment or the LED current; don't change the firmware.
+
+## OLED screen (v0.2)
+
+**Library:** Arduino IDE → Library Manager → install **Adafruit SSD1306** (accept "install all", which adds Adafruit GFX). To build without a screen, set `#define USE_OLED 0` at the top of the sketch.
+
+**Wiring (GME12864-11, 4 pins):** VCC → **3V3**, GND → GND, SDA → **GPIO21**, SCL → **GPIO22**. Address 0x3C or 0x3D is detected automatically. If the screen isn't found, the board prints a message and carries on without it.
+
+**Pages** (press the board's **BOOT** button to switch):
+
+| Page | Shows |
+|---|---|
+| 0 Status | Big verdict word, a second line, sensor checks, mL remaining; a dot in the top-right corner blinks on every detected drop |
+| 1 Agreement | Optical vs weight flow as two bars, plus the auto-calibrated drop factor (needs the dashboard) |
+| 2 IR scope | Live receiver signal over the last 0.5 s with the detection threshold lines. Use it to align the sensor without the Serial Plotter |
+
+- **With the dashboard connected,** the status page shows the dashboard's diagnosis. Alarms flash (inverted) and sensor faults get a frame; both take over any page except the scope.
+- **Without the dashboard for more than 3 s,** the screen shows "SOLO" and only what the device knows by itself: drop-based flow, NO DROPS, NO IR, and the scale reading. It never claims "confirmed".
+
+**Other v0.2 changes:**
+- HX711 samples go through a median-of-3 filter, so one corrupt read can't knock out the weight channel.
+- `avg <n>` sets an optical moving average (1 = off, the default; not saved). If the scope or plotter shows mains hum, try `avg 17`. It also smooths the drop pulse, so check the drops are still counted.
 
 ## Mechanical gotchas that ruin the weight signal
 
@@ -105,4 +129,6 @@ Drop line: `{"type":"drop","t":ms,"amp":signed_peak,"w":width_ms}`. Also `msg`, 
 
 - **WROOM-32UE has no onboard antenna**, only a U.FL/IPEX connector. Wi-Fi without an external 2.4 GHz antenna will barely work, so this firmware uses USB serial only. Get an antenna before attempting remote monitoring.
 - If uploads fail: hold **BOOT** when "Connecting…" appears, use a data (not charge-only) USB cable, or lower `upload_speed`.
-- Verified here by compiling against stub headers and simulating the detector and regression logic. It has **not yet been compiled with the real ESP32 core or run on hardware**. Send me any compiler errors.
+- Compiles on Arduino-ESP32 core 3.3.12 and runs on the DevKitC: status lines verified with nothing wired. Not yet verified with sensors attached.
+- **Aim the beam about 10 mm below the drip tip**, not at the tip: a drop hanging and growing in the beam makes a slow ramp that inflates the noise estimate and hides the real fall. In `raw 1` mode you want short, sharp pulses.
+- **Use the smallest receiver resistor that keeps `o_base` in range.** A big resistor on long jumper wires picks up mains hum, which the detector counts as noise, raising the threshold until real drops are missed.
