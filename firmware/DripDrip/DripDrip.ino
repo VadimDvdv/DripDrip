@@ -313,6 +313,7 @@ static volatile int32_t  hxLastRaw = 0;
 static volatile uint32_t hxSeq = 0, hxLastMs = 0;
 static volatile bool     massClearReq = false;
 static volatile bool     hxRawPrint = false;
+static volatile bool     hxStuck = false;     // identical raw words in a row => wiring fault
 
 // Channel A, gain 128 (25 clocks). Interrupts off on this core for ~60 us
 // so SCK can't be held high > 60 us (which powers the HX711 down).
@@ -345,9 +346,18 @@ static int32_t median3(int32_t a, int32_t b, int32_t c) {
 
 static void hxTask(void *) {
   int32_t h0 = 0, h1 = 0; int primed = 0;
+  int32_t prevIn = 0; int same = 0;
   for (;;) {
     int32_t rawIn;
     if (hxRead(rawIn)) {
+      // A live HX711 always has tens of counts of noise, so 10 identical words in a row
+      // means DOUT isn't really the HX711: e.g. no VCC (chip back-powered through SCK, DOUT
+      // copies the clock -> raw = -1) or DOUT shorted to SCK. Also catches rail values.
+      same = (rawIn == prevIn) ? same + 1 : 0;
+      prevIn = rawIn;
+      bool stuck = same >= 10;
+      if (stuck && !hxStuck) Serial.println("{\"type\":\"err\",\"text\":\"HX711 data stuck - check HX711 VCC=3.3V and that DT/SCK aren't shorted\"}");
+      hxStuck = stuck;
       // Median of the last 3 samples: one corrupt read can't knock out the weight channel.
       int32_t raw = rawIn;
       if (primed >= 2) raw = median3(h0, h1, rawIn); else primed++;
@@ -420,7 +430,7 @@ static WStats computeWeight(uint32_t now) {
   WStats w;
   memset(&w, 0, sizeof(w));
   w.gNow = NAN; w.slope = NAN; w.slopeSE = NAN; w.resid = NAN; w.std1 = NAN;
-  w.ok  = hxSeq > 0 && (now - hxLastMs) < HX_TIMEOUT_MS;
+  w.ok  = hxSeq > 0 && (now - hxLastMs) < HX_TIMEOUT_MS && !hxStuck;
   w.cal = cfg.hxCal != 0;
   w.raw = hxLastRaw;
 

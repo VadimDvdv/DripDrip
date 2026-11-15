@@ -23,6 +23,31 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 
+# At-rest weight-flow error (1 std, mL/min) versus estimation window (s), measured on the real
+# rig on 14 Nov (10.6 min, nothing flowing). The scale wanders slowly (about +-0.5 g over tens of
+# seconds), so short windows see "flow" that isn't there. Replace with "Measure scale noise".
+DEFAULT_NOISE_PROFILE = {30.0: 1.08, 60.0: 0.63, 90.0: 0.38, 120.0: 0.25, 180.0: 0.14}
+
+
+def noise_floor(profile: dict, window_s: float) -> float:
+    """Log-log interpolation of the at-rest flow error for a window length (mL/min)."""
+    pts = sorted((float(w), float(v)) for w, v in profile.items() if v and v > 0 and w > 0)
+    if not pts:
+        return 0.0
+    w = max(window_s, 1.0)
+    if len(pts) == 1:
+        return pts[0][1] * (pts[0][0] / w)
+    if w <= pts[0][0]:
+        (w0, v0), (w1, v1) = pts[0], pts[1]
+    elif w >= pts[-1][0]:
+        (w0, v0), (w1, v1) = pts[-2], pts[-1]
+    else:
+        for (w0, v0), (w1, v1) in zip(pts, pts[1:]):
+            if w0 <= w <= w1:
+                break
+    k = math.log(v1 / v0) / math.log(w1 / w0)
+    return v0 * (w / w0) ** k
+
 LEVELS = ["ok", "info", "warning", "sensor", "unknown", "alarm"]
 LEVEL_RANK = {lvl: i for i, lvl in enumerate(LEVELS)}
 
@@ -35,8 +60,8 @@ class Settings:
     low_volume_ml: float = 50.0
     use_autocal: bool = True
     rho: float = 0.998                 # g/mL
-    window_s: float = 30.0             # aligned comparison window
-    long_window_s: float = 60.0        # second, more precise window for slow-developing faults
+    window_s: float = 120.0            # aligned optical-vs-weight comparison window
+    long_window_s: float = 240.0       # second, more precise window for slow-developing faults
     fast_window_s: float = 12.0        # responsive optical estimate for display/alerts
     stop_after_s: float = 8.0          # no drops this long => drops stopped (minimum)
     stop_after_max_s: float = 30.0     # ... stretched for slow drips, up to this
@@ -45,6 +70,8 @@ class Settings:
     settle_hold_s: float = 5.0         # weight treated as unreliable after a disturbance
     min_snr: float = 6.0
     disagree_hold_s: float = 4.0       # disagreement must persist this long
+    stop_max_post_s: float = 150.0     # longest stretch of post-stop weight data used for the verdict
+    noise_profile: dict = field(default_factory=lambda: dict(DEFAULT_NOISE_PROFILE))
 
 
 @dataclass
@@ -96,16 +123,50 @@ def linfit(xs, ys):
     return b, a, sd, sd / math.sqrt(sxx), n
 
 
+def measure_noise_profile(rows: list[dict], windows=(15.0, 30.0, 60.0, 90.0, 120.0, 180.0)) -> dict:
+    """At-rest weight-flow error per window from status rows recorded with nothing flowing.
+
+    For each window length W, fit a line to every W-second stretch (stepping 1 s) and take the
+    standard deviation of the resulting "flow" in mL/min. Needs at least 1.25 W of data per window.
+    """
+    pts = [(r["t"] / 1000.0, r["w_g"]) for r in rows
+           if r.get("w_cal") and r.get("w_ok") and r.get("w_stable") and r.get("w_g") is not None]
+    if len(pts) < 20:
+        return {}
+    out = {}
+    total = pts[-1][0] - pts[0][0]
+    for w in windows:
+        if total < 1.25 * w:
+            continue
+        slopes, i, last_start = [], 0, -1e9
+        for i, (t0, _) in enumerate(pts):
+            if t0 - last_start < 1.0:
+                continue
+            seg = [p for p in pts[i:] if p[0] - t0 <= w]
+            if seg[-1][0] - t0 < 0.95 * w:
+                break
+            fit = linfit([p[0] for p in seg], [p[1] for p in seg])
+            if fit:
+                slopes.append(fit[0] * 60.0)
+                last_start = t0
+        if len(slopes) >= 5:
+            m = sum(slopes) / len(slopes)
+            out[w] = max(0.02, math.sqrt(sum((x - m) ** 2 for x in slopes) / len(slopes)))
+    return out
+
+
 class Calibrator:
     """Average drop volume = -d(mass)/d(drop count) / rho over clean stretches."""
 
-    MIN_SPAN_S, MIN_DROPS = 60.0, 40
+    MIN_SPAN_S, MIN_DROPS = 120.0, 60   # long enough for the scale's slow wander to average out
+    LOCK_SPAN_S = 180.0                 # after this much clean data, lock: later faults can't leak in
     V_MIN, V_MAX = 1 / 60, 1 / 8       # plausible mL/drop
 
     def __init__(self, rho: float):
         self.rho = rho
         self.done: list[tuple[float, float]] = []   # (V, se) of closed segments
         self.seg: list[tuple[float, float, float]] = []  # (t, drops, grams)
+        self.locked: tuple[float, float] | None = None
 
     def _estimate(self, seg):
         if len(seg) < 10:
@@ -123,10 +184,18 @@ class Calibrator:
         return v, se
 
     def feed(self, t, drops, grams, clean: bool):
+        if self.locked:
+            return
         if clean and self.seg and (t - self.seg[-1][0] > 2.0 or drops < self.seg[-1][1]):
             self.close()
         if clean:
             self.seg.append((t, drops, grams))
+            if self.seg[-1][0] - self.seg[0][0] >= self.LOCK_SPAN_S:
+                est = self._estimate(self.seg)
+                if est:
+                    self.done.append(est)
+                    self.locked = self.result_from(self.done)
+                    self.seg = []
         else:
             self.close()
 
@@ -136,7 +205,15 @@ class Calibrator:
             self.done.append(est)
         self.seg = []
 
+    @staticmethod
+    def result_from(ests):
+        w = [1 / max(se, 1e-6) ** 2 for _, se in ests]
+        v = sum(wi * vi for wi, (vi, _) in zip(w, ests)) / sum(w)
+        return v, math.sqrt(1 / sum(w))
+
     def result(self):
+        if self.locked:
+            return self.locked
         ests = list(self.done)
         cur = self._estimate(self.seg)
         if cur:
@@ -149,7 +226,7 @@ class Calibrator:
         return v, se
 
     def reset(self):
-        self.done, self.seg = [], []
+        self.done, self.seg, self.locked = [], [], None
 
 
 class FusionEngine:
@@ -177,6 +254,7 @@ class FusionEngine:
         self.dis_active = False
         self.dis_clear_since = None
         self.stop = None                     # active "drops stopped" event
+        self.lost = None                     # active "optical signal lost" event
         self.restarted = False
         self.low_vol = False
 
@@ -192,8 +270,23 @@ class FusionEngine:
         fw = linfit([h["t"] for h in win], [h["g"] for h in win])
         if not fo or not fw:
             return None
-        return (max(0.0, fo[0]) * 60 * v_drop, fo[3] * 60 * v_drop,
-                -fw[0] * 60 / self.s.rho, fw[3] * math.sqrt(2) * 60 / self.s.rho)
+        span = win[-1]["t"] - win[0]["t"]
+        se_w = math.hypot(fw[3] * math.sqrt(2) * 60 / self.s.rho, noise_floor(self.s.noise_profile, span))
+        return (max(0.0, fo[0]) * 60 * v_drop, fo[3] * 60 * v_drop, -fw[0] * 60 / self.s.rho, se_w)
+
+    def _post_slope(self, t0: float, t: float):
+        """Weight flow from data after t0 (+guard), with the measured-noise floor. (q, se) or None."""
+        s = self.s
+        post = [h for h in self.hist if h["t"] >= t0 + s.stop_guard_s and t - h["t"] <= s.stop_max_post_s
+                and h["w_good"] and h["g"] is not None]
+        if len(post) < 8 or post[-1]["t"] - post[0]["t"] < 4.0:
+            return None
+        fit = linfit([h["t"] for h in post], [h["g"] for h in post])
+        if not fit:
+            return None
+        span = post[-1]["t"] - post[0]["t"]
+        se = max(fit[3] * math.sqrt(2) * 60 / s.rho, noise_floor(s.noise_profile, span))
+        return -fit[0] * 60 / s.rho, se
 
     # ------------------------------------------------------------------
     def update(self, m: dict) -> Assessment:
@@ -218,7 +311,10 @@ class FusionEngine:
         o_sat = bool(m.get("o_sat"))
         o_snr = m.get("o_snr")
         o_since = m.get("o_since")
-        if o_sat:
+        # A receiver pinned near the top of the ADC range can still see drops as dips.
+        # Only call it "no signal" once drops have also stopped arriving.
+        near_sat = o_sat and o_since is not None and o_since < s.stop_after_s
+        if o_sat and not near_sat:
             oh = "no_signal"
         elif t - self.t_opt_anom < s.anomaly_hold_s:
             oh = "anomaly"
@@ -248,7 +344,7 @@ class FusionEngine:
         # ---- history and aligned-window estimates ----
         self.hist.append({"t": t, "drops": o_drops, "g": w_g, "w_good": w_good_now,
                           "opt": opt_usable, "std1": m.get("w_std1")})
-        while self.hist and t - self.hist[0]["t"] > max(120.0, 3 * s.window_s):
+        while self.hist and t - self.hist[0]["t"] > max(300.0, 1.2 * s.long_window_s, s.stop_max_post_s + 60):
             self.hist.popleft()
         win = [h for h in self.hist if t - h["t"] <= s.window_s]
 
@@ -268,11 +364,16 @@ class FusionEngine:
                 q_o = max(0.0, fit[0]) * 60 * v_drop
                 q_o_se = fit[3] * 60 * v_drop
         w_pts = [h for h in win if h["w_good"] and h["g"] is not None]
-        if enough and w_good_now and len(w_pts) >= 0.8 * len(win):
+        # The scale's slow wander makes slopes over <30 s meaningless (±3 mL/min at 10 s),
+        # so weight flow is only reported once 30 s of data exist.
+        w_enough = span >= min(30.0, 0.5 * s.window_s)
+        if w_enough and w_good_now and len(w_pts) >= 0.8 * len(win):
             fit = linfit([h["t"] for h in w_pts], [h["g"] for h in w_pts])
             if fit:
                 q_w = -fit[0] * 60 / s.rho
-                q_w_se = fit[3] * math.sqrt(2) * 60 / s.rho
+                w_span = w_pts[-1]["t"] - w_pts[0]["t"]
+                # white-noise error from the fit, plus the measured slow-wander floor for this span
+                q_w_se = math.hypot(fit[3] * math.sqrt(2) * 60 / s.rho, noise_floor(s.noise_profile, w_span))
         q_o_fast = None
         fwin = [h for h in win if t - h["t"] <= s.fast_window_s]
         if opt_usable and len(fwin) >= 8 and all(h["opt"] for h in fwin):
@@ -320,7 +421,7 @@ class FusionEngine:
             # seconds. A hand on the clamp shifts the hanging load by a step; a step before
             # the guard cannot change the slope after it. Re-evaluated on every update, in
             # both directions, so an early wrong call is corrected instead of latched.
-            post = [h for h in self.hist if h["t"] >= ev["t0"] + s.stop_guard_s and t - h["t"] <= 45.0
+            post = [h for h in self.hist if h["t"] >= ev["t0"] + s.stop_guard_s and t - h["t"] <= s.stop_max_post_s
                     and h["w_good"] and h["g"] is not None]
             fit = None
             if len(post) >= 8 and post[-1]["t"] - post[0]["t"] >= 4.0:
@@ -330,7 +431,8 @@ class FusionEngine:
                 sd1 = [h["std1"] for h in post if h.get("std1")]
                 sd1 = sum(sd1) / len(sd1) if sd1 else 0.3
                 # floor: white-noise slope error of 10 Hz samples with the measured 1-s scatter
-                se_floor = sd1 * math.sqrt(12 / (10 * span ** 3)) * 60 / s.rho
+                se_floor = max(sd1 * math.sqrt(12 / (10 * span ** 3)) * 60 / s.rho,
+                               noise_floor(s.noise_profile, span))   # measured slow wander dominates
                 q_after = -fit[0] * 60 / s.rho
                 se = max(fit[3] * math.sqrt(2) * 60 / s.rho, se_floor)
                 ev["q_after"], ev["q_after_se"] = q_after, se
@@ -349,6 +451,23 @@ class FusionEngine:
                 for h in self.hist:
                     if h["t"] >= ev["t0"]:
                         h["opt"] = False
+
+        # ---- optical signal lost (ADC at the rail): ask the scale, using data after the loss only ----
+        if not opt_usable:
+            if self.lost is None:
+                prev = [h.get("q_fast") for h in list(self.hist)[:-1] if h.get("q_fast") is not None]
+                self.lost = {"t0": t, "q_prev": prev[-1] if prev else None, "verdict": "pending",
+                             "q_after": None, "q_after_se": None}
+            ev = self.lost
+            ps = self._post_slope(ev["t0"], t)
+            if ps and w_good_now:
+                ev["q_after"], ev["q_after_se"] = ps
+                ref = ev["q_prev"] if (ev["q_prev"] is not None and ev["q_prev"] >= 0.4) else None
+                mid = 0.5 * ref if ref else 0.4
+                z = (ps[0] - mid) / ps[1]
+                ev["verdict"] = "no_flow" if z < -3 else ("flow_continues" if z > 3 else "pending")
+        else:
+            self.lost = None
 
         # ---- choose best flow estimate ----
         optical_fault = self.stop is not None and self.stop["verdict"] == "flow_continues"
@@ -445,24 +564,37 @@ class FusionEngine:
         if oh == "no_signal":
             causes = ["IR LED off or disconnected", "Receiver disconnected",
                       "Beam fully blocked", "Ambient light saturating receiver"]
-            if q_w is not None and q_w_se is not None and q_w > 3 * q_w_se + 0.3:
+            ev = self.lost
+            lost_for = t - ev["t0"] if ev else 0.0
+            if ev and ev["verdict"] == "flow_continues":
+                q_best, src = ev["q_after"], "weight"
                 findings.append(Finding("sensor", "Optical sensor lost - flow continues",
-                                        f"Receiver output is at the ADC rail, but the reservoir is still "
-                                        f"losing mass at {q_w:.1f} ± {q_w_se:.1f} mL/min.", causes))
-            elif q_w is not None and q_w_se is not None and q_w < max(3 * q_w_se, 0.4):
+                                        f"Receiver output has been at the ADC rail for {lost_for:.0f} s, but the "
+                                        f"reservoir is still losing mass at {ev['q_after']:.1f} \u00b1 "
+                                        f"{ev['q_after_se']:.1f} mL/min.", causes))
+            elif ev and ev["verdict"] == "no_flow":
                 flow_state = "stopped"
+                q_best, src = 0.0, "weight"
                 findings.append(Finding("alarm", "No flow on weight - optical sensor lost",
-                                        f"Receiver output is at the ADC rail and the reservoir mass is flat "
-                                        f"({q_w:.1f} ± {q_w_se:.1f} mL/min). Weight is the only evidence.",
+                                        f"Receiver output has been at the ADC rail for {lost_for:.0f} s and the "
+                                        f"reservoir mass is flat ({ev['q_after']:.1f} \u00b1 {ev['q_after_se']:.1f} "
+                                        "mL/min). Weight is the only evidence.",
                                         ["Flow stopped AND optical fault", "Optical cable or power pulled"]))
             else:
-                findings.append(Finding("sensor", "No optical signal",
-                                        "Receiver output is at the ADC rail. Weight has no verdict yet.", causes))
+                findings.append(Finding("sensor", "No optical signal - checking weight",
+                                        f"Receiver output has been at the ADC rail for {lost_for:.0f} s. Checking "
+                                        "whether the reservoir is still losing mass.", causes))
         elif oh == "anomaly" and self.stop is None:
             findings.append(Finding("sensor", "Optical signal disturbance",
                                     "The receiver level jumped for longer than a drop.",
                                     ["Sensor touched or moved", "Beam briefly blocked", "Ambient light change"]))
-        elif oh == "weak":
+        if near_sat and oh != "no_signal":
+            findings.append(Finding("info", "IR receiver near saturation",
+                                    "Receiver level is at the top of the ADC range. Drops are still detected, "
+                                    "but a clamp stop will be reported as an optical fault.",
+                                    ["Use a smaller photodiode resistor (47k)", "Larger LED resistor",
+                                     "Ambient light"]))
+        if oh == "weak":
             findings.append(Finding("warning", "Weak drop signal",
                                     f"Drop signal-to-noise ratio is {o_snr:.1f}; some drops may be missed.",
                                     ["Alignment", "Ambient light", "Receiver gain too low"]))

@@ -7,6 +7,8 @@ Close the Arduino Serial Monitor/Plotter first: only one program can use the por
 """
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import streamlit as st
 
@@ -81,9 +83,20 @@ with st.sidebar:
     low_v = st.number_input("Low-volume alert (mL)", 0.0, 2000.0, 50.0, 10.0)
     autocal = st.toggle("Use auto-calibrated drop volume", value=True)
     rt.apply_settings(Settings(drop_factor=df_nom, expected_flow=exp or None,
-                               tolerance=tol / 100, low_volume_ml=low_v, use_autocal=autocal))
+                               tolerance=tol / 100, low_volume_ml=low_v, use_autocal=autocal,
+                               noise_profile=dict(rt.noise_profile)))
     if st.button("Reset auto-calibration", width="stretch"):
         rt.reset_calibration()
+
+    st.subheader("Scale noise")
+    st.caption(f"Weight-flow uncertainty at rest: \u00b1{rt.noise_profile.get(120.0, float('nan')):.2f} mL/min "
+               f"over 120 s ({rt.noise_info}). Measure again at the venue: clamp closed, nobody touching "
+               "the table, reservoir hanging.")
+    n1, n2 = st.columns(2)
+    if n1.button("Measure (3 min)", width="stretch", disabled=rt.source is None):
+        rt.start_noise_measure()
+    if n2.button("Use default", width="stretch"):
+        rt.reset_noise_profile()
 
     st.subheader("Mark what you just did")
     c1, c2 = st.columns(2)
@@ -134,8 +147,33 @@ def live_view():
         st.info("Choose a data source in the sidebar.")
         return
     if snap["age"] is None:
-        st.info("Waiting for data...")
+        err = getattr(src, "error", None)
+        nb = getattr(src, "rx_bytes", None)
+        if err:
+            st.error(f"Can't read the port: {err}")
+        elif nb == 0:
+            st.info("Port open, but the board has sent nothing yet. If this lasts more than "
+                    "2 s: press the EN (reset) button on the ESP32, and make sure the Arduino "
+                    "Serial Monitor/Plotter is closed.")
+        elif nb:
+            st.warning(f"Receiving bytes ({nb}) but no valid data lines. Usually a baud-rate "
+                       "mismatch (firmware must use 921600) or the board is in download mode: "
+                       "press EN (reset).")
+        else:
+            st.info("Waiting for data...")
+        if snap["messages"]:
+            st.caption("Last text from the port:")
+            st.code("\n".join(snap["messages"][-5:]))
         return
+    job = rt.noise_job_status()
+    if job and job["status"] == "running":
+        left = max(0, 180 - job.get("elapsed", 0))
+        st.info(f"Measuring scale noise: keep the rig still, clamp closed. {int(left // 60)}:{int(left % 60):02d} left.")
+        st.progress(min(1.0, job.get("elapsed", 0) / 180))
+    elif job and job["status"] == "done" and time.time() - job["start"] < 200:
+        st.success("Scale noise measured (mL/min at rest per window): " + job["msg"])
+    elif job and job["status"] == "failed" and time.time() - job["start"] < 200:
+        st.error("Scale noise measurement failed: " + job["msg"])
     if src is not None and not src.done and snap["age"] > 3:
         st.error(f"No data from the device for {snap['age']:.0f} s. Check the USB connection. "
                  "This is a communication problem, not evidence that flow stopped.")
@@ -192,21 +230,23 @@ def live_view():
         df = pd.DataFrame(rows)
         df["min"] = (df["t"] - df["t"].iloc[0]) / 60000.0
         df = df.set_index("min")
-        opt = df["q_o_fast"].where(df["q_o_fast"].notna(), df["q_o_al"])
+        def num(cols):   # all-None columns are object dtype; Streamlit charts need floats
+            return df[cols].apply(pd.to_numeric, errors="coerce").astype(float)
+        opt = num(["q_o_fast"])["q_o_fast"].fillna(num(["q_o_al"])["q_o_al"])
         g1, g2 = st.columns(2)
         with g1:
             st.caption("Flow, mL/min (x: minutes)")
-            st.line_chart(pd.DataFrame({"optical": opt, "weight": df["q_w_al"]}), height=230)
+            st.line_chart(pd.DataFrame({"optical": opt, "weight": num(["q_w_al"])["q_w_al"]}), height=230)
         with g2:
             st.caption("Reservoir mass, g")
-            st.line_chart(df[["w_g"]], height=230)
+            st.line_chart(num(["w_g"]), height=230)
         g3, g4 = st.columns(2)
         with g3:
             st.caption("Optical drop SNR")
-            st.line_chart(df[["o_snr"]], height=160)
+            st.line_chart(num(["o_snr"]), height=160)
         with g4:
             st.caption("Weight noise over the last 1 s, g")
-            st.line_chart(df[["w_std1"]], height=160)
+            st.line_chart(num(["w_std1"]), height=160)
 
     # events
     st.subheader("Event log")

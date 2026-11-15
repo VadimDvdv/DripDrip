@@ -114,8 +114,9 @@ def offline_text(task: str, facts: dict, question: str = "") -> str:
         if tops[0]["possible_causes"]:
             parts.append("Possible causes: " + ", ".join(tops[0]["possible_causes"][:3]) + ".")
     if cur.get("optical_flow_ml_min") is not None or cur.get("weight_flow_ml_min") is not None:
-        parts.append(f"Optical {cur.get('optical_flow_ml_min')} mL/min, weight "
-                     f"{cur.get('weight_flow_ml_min')} mL/min.")
+        f = lambda v: "n/a" if v is None else f"{v:.2f}"
+        parts.append(f"Optical {f(cur.get('optical_flow_ml_min'))} mL/min, weight "
+                     f"{f(cur.get('weight_flow_ml_min'))} mL/min.")
     text = " ".join(parts)
     return ("Gemini unavailable, so this question can't be answered. " + text) if task == "ask" else text
 
@@ -168,7 +169,8 @@ class Explainer:
             except Exception as e:  # model missing -> try the next one; anything else -> stop
                 last_exc = e
                 msg = str(e).lower()
-                if "not found" in msg or "404" in msg or "not supported" in msg:
+                if ("not found" in msg or "404" in msg or "not supported" in msg
+                        or "429" in msg or "resource_exhausted" in msg or "quota" in msg):
                     continue
                 raise
             text = (getattr(resp, "text", None) or "").strip()

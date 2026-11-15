@@ -53,7 +53,8 @@ SCENARIOS: dict[str, list[Segment]] = {
                      Segment(60, 3.0, optical_ok=False, rail=True, label="LED off / beam dark, flow continues"),
                      Segment(40, 3.0, label="normal"),
                      Segment(60, 0.0, optical_ok=False, rail=True, label="LED off AND clamp closed")],
-    "miscount": [Segment(120, 3.0, label="normal"),
+    "rest": [Segment(600, 0.0, label="at rest, clamp closed (for Measure scale noise)")],
+    "miscount": [Segment(240, 3.0, label="normal"),
                  Segment(150, 3.0, detect=0.75, label="optical misses 25% of drops")],
 }
 SCENARIO_START_MASS = {"near_empty": 62.0}
@@ -68,11 +69,15 @@ def _r(v, d):
 class Simulator:
     def __init__(self, segments: list[Segment], m0_g: float = 500.0, v_drop_ml: float = 1 / 18.0,
                  rho: float = 0.998, win_s: float = 30.0, opt_win_s: float = 30.0,
-                 drop_factor: float = 20.0, stab_g: float = 1.5, noise_g: float = 0.3, seed: int = 1):
+                 drop_factor: float = 20.0, stab_g: float = 1.5, noise_g: float = 0.3, seed: int = 1,
+                 wander_g: float = 0.0, wander_tau_s: float = 20.0):
         self.segments = segments
         self.m0, self.v_drop, self.rho = m0_g, v_drop_ml, rho
         self.win, self.owin, self.df, self.stab, self.noise = win_s, opt_win_s, drop_factor, stab_g, noise_g
         self.rng = random.Random(seed)
+        # Slow, bounded wander of the reading (thermal EMF / drafts on the real rig): an
+        # Ornstein-Uhlenbeck process with stationary std wander_g and time constant wander_tau_s.
+        self.wander_g, self.wander_tau = wander_g, wander_tau_s
 
     def total_duration(self) -> float:
         return sum(s.dur for s in self.segments)
@@ -103,6 +108,9 @@ class Simulator:
         seg_start, seg_idx = 0.0, -1
         base = 1800.0
         n_ticks = int(self.total_duration() / dt)
+        wander = 0.0
+        w_a = math.exp(-dt / self.wander_tau) if self.wander_g > 0 else 0.0
+        w_b = self.wander_g * math.sqrt(1 - w_a * w_a) if self.wander_g > 0 else 0.0
 
         for i in range(1, n_ticks + 1):
             t = i * dt
@@ -140,7 +148,9 @@ class Simulator:
                 spikes += 1
 
             # HX711 sample
-            g = water_g + rng.gauss(0, self.noise)
+            if self.wander_g > 0:
+                wander = w_a * wander + w_b * rng.gauss(0, 1)
+            g = water_g + rng.gauss(0, self.noise) + wander
             if bump_t is not None and 0 <= t - bump_t < 8:
                 tb = t - bump_t
                 g += 25 * math.exp(-tb / 1.5) * math.sin(2 * math.pi * 1.3 * tb)
@@ -214,8 +224,13 @@ class Simulator:
             }
 
 
-def make(scenario: str, seed: int = 1) -> Simulator:
-    return Simulator(SCENARIOS[scenario], m0_g=SCENARIO_START_MASS.get(scenario, 500.0), seed=seed)
+# Measured on the real rig (HX711 + 5 kg cell, 14 Nov): 0.05 g fast noise plus a slow wander.
+REAL_RIG = dict(noise_g=0.06, wander_g=0.4, wander_tau_s=25.0)
+
+
+def make(scenario: str, seed: int = 1, realistic: bool = True) -> Simulator:
+    kw = REAL_RIG if realistic else {}
+    return Simulator(SCENARIOS[scenario], m0_g=SCENARIO_START_MASS.get(scenario, 500.0), seed=seed, **kw)
 
 
 if __name__ == "__main__":

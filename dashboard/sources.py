@@ -19,9 +19,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 from explain import Explainer, build_facts
-from fusion import Assessment, FusionEngine, Settings
+from fusion import DEFAULT_NOISE_PROFILE, Assessment, FusionEngine, Settings, measure_noise_profile
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
+NOISE_PATH = Path(__file__).resolve().parent / "noise_profile.json"
+NOISE_SECONDS = 180.0
 
 
 def list_serial_ports() -> list[tuple[str, str]]:
@@ -115,7 +117,7 @@ _OLED_MAP = [
     ("No flow on weight", "STOPPED?", "weight only, IR lost"),
     ("Optical sensor not detecting", "OPT FAULT", "flow continues"),
     ("Optical sensor lost", "OPT FAULT", "flow continues"),
-    ("No optical signal", "OPT FAULT", "no IR signal"),
+    ("No optical signal", "OPT LOST", "checking weight..."),
     ("Optical signal disturbance", "IR JUMP", "beam moved/blocked?"),
     ("Optical count", "MISMATCH", "optical vs weight"),
     ("Load cell not responding", "WT FAULT", "no HX711 data"),
@@ -174,6 +176,8 @@ class SerialSource(_Source):
         super().__init__(store)
         self.port, self.baud = port, baud
         self.ser = None
+        self.rx_bytes = 0
+        self.bad_lines = 0
         self.wlock = threading.Lock()
         LOG_DIR.mkdir(exist_ok=True)
         self.log_path = LOG_DIR / time.strftime("live_%Y%m%d_%H%M%S.jsonl")
@@ -206,12 +210,15 @@ class SerialSource(_Source):
                     chunk = ser.read(ser.in_waiting or 1)
                     if not chunk:
                         continue
+                    self.rx_bytes += len(chunk)
                     buf += chunk
                     while b"\n" in buf:
                         raw, buf = buf.split(b"\n", 1)
                         line = raw.decode("utf-8", errors="replace").strip()
                         if line:
                             self._log(line)
+                            if not line.startswith('{"'):
+                                self.bad_lines += 1
                             self.store.ingest(line)
                             if line.startswith('{"type":"s"'):
                                 self._push_display()
@@ -327,6 +334,15 @@ class Runtime:
         self.source: _Source | None = None
         self.mode = None
         self.explainer = Explainer()
+        self.noise_profile = dict(DEFAULT_NOISE_PROFILE)
+        self.noise_info = "default: measured on the rig, 14 Nov"
+        self.noise_job: dict | None = None
+        try:
+            saved = json.loads(NOISE_PATH.read_text())
+            self.noise_profile = {float(k): float(v) for k, v in saved["profile"].items()}
+            self.noise_info = f"measured {saved.get('measured_at', '?')}"
+        except (OSError, ValueError, KeyError):
+            pass
         self.store.on_event = lambda ev: self.explainer.maybe_auto(ev, self.ai_facts)
 
     def ai_facts(self) -> dict:
@@ -347,6 +363,55 @@ class Runtime:
 
     def start_replay(self, path: str, speed: float):
         self._start(ReplaySource(self.store, path, speed), "replay")
+
+    # ---------------------------------------------------------------- scale noise
+    def start_noise_measure(self):
+        self.noise_job = {"start": time.time(), "status": "running", "msg": ""}
+
+    def noise_job_status(self) -> dict | None:
+        """Called by the UI every refresh; finishes the measurement when enough data exists."""
+        job = self.noise_job
+        if not job or job["status"] != "running":
+            return job
+        elapsed = time.time() - job["start"]
+        job["elapsed"] = elapsed
+        if elapsed < NOISE_SECONDS:
+            return job
+        with self.store.lock:
+            rows = [r for r in self.store.rows if r.get("host_t", 0) >= job["start"]]
+        drops = [r.get("o_drops") or 0 for r in rows]
+        if not rows:
+            job.update(status="failed", msg="No data arrived during the measurement.")
+        elif drops and max(drops) - min(drops) > 2:
+            job.update(status="failed", msg="Drops were counted: close the clamp so nothing flows, then measure again.")
+        else:
+            # 3 minutes only samples the 30 s and 60 s windows reliably. Use them to set the noise
+            # LEVEL, and keep the SHAPE across window lengths from the 10.6-min reference log.
+            meas = measure_noise_profile(rows, windows=(30.0, 60.0))
+            if 30.0 not in meas or 60.0 not in meas:
+                job.update(status="failed", msg="Weight data was missing or unstable. Keep the rig still and retry.")
+            else:
+                ratios = [meas[w] / DEFAULT_NOISE_PROFILE[w] for w in (30.0, 60.0)]
+                scale = min(3.0, max(0.4, (ratios[0] * ratios[1]) ** 0.5))
+                prof = {w: v * scale for w, v in DEFAULT_NOISE_PROFILE.items()}
+                self.noise_profile = prof
+                self.noise_info = "measured " + time.strftime("%H:%M")
+                try:
+                    NOISE_PATH.write_text(json.dumps({"profile": {str(k): v for k, v in prof.items()},
+                                                      "measured_at": time.strftime("%Y-%m-%d %H:%M")}, indent=1))
+                except OSError:
+                    pass
+                job.update(status="done", msg=f"{scale:.2f}x the reference rig; \u00b1{prof[60.0]:.2f} mL/min over 60 s, "
+                                              f"\u00b1{prof[120.0]:.2f} over 120 s")
+        return job
+
+    def reset_noise_profile(self):
+        self.noise_profile = dict(DEFAULT_NOISE_PROFILE)
+        self.noise_info = "default: measured on the rig, 14 Nov"
+        try:
+            NOISE_PATH.unlink()
+        except OSError:
+            pass
 
     def stop(self):
         if self.source:

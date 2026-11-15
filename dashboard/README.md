@@ -28,27 +28,38 @@ In the sidebar, pick a source:
 
 ## How the diagnosis works (use this for the Devpost write-up)
 
-1. **Compare like with like.** Optical flow is the least-squares slope of the cumulative drop count, and weight flow is the slope of reservoir mass, both over the **same 30 s window**. A real change in flow moves both estimates the same way, so it doesn't look like a sensor disagreement. A second, 60 s window catches slow, subtle faults with about 2.8x better precision.
-2. **The fast sensor alarms, the slow sensor confirms.** When drops stop for 8 s (stretched to 2.5 drop intervals for slow drips, at most 30 s), an alarm is raised immediately. The weight then decides from the **slope of reservoir mass after the stop**, skipping the first 3 s so a hand on the clamp can't bias it: if that flow is clearly below half the previous rate (z < −3), the stop is **confirmed by both sensors**; if clearly above (z > 3), flow is continuing and the **optical sensor is at fault**. The verdict is re-evaluated on every update in both directions, so an early wrong call corrects itself. If the optical receiver sits at the ADC rail (LED off, beam fully dark), the weight alone decides between "optical sensor lost, flow continues" and a weight-only no-flow alarm.
-3. **Auto-calibration.** The average drop volume is the slope of mass vs drop count, measured only during clean stretches (both sensors healthy, no disagreement, at least 60 s and 40 drops). It's rejected if it lands more than 25% from the package value, because that more likely means a counting fault than a strange drip set.
-4. **Health gating.** Weight is ignored while the reservoir is disturbed and until the disturbance leaves the window. Optical data recorded during an identified optical fault is marked bad afterwards. "Unknown" is a legitimate answer.
-5. **Findings separate what was observed from what might explain it.** Two sensors can't uniquely identify every fault, so causes are listed as possibilities.
+1. **Compare like with like.** Optical flow is the least-squares slope of the cumulative drop count; weight flow is the slope of reservoir mass. Both use the **same 120 s window**, plus a 240 s window for slow faults. A real change in flow moves both estimates identically.
+2. **The scale knows its own noise.** The real load cell has 0.05 g of fast noise, but also wanders slowly by about ±0.5 g over tens of seconds (air currents and temperature acting on microvolt-level signals). Over a 30 s window that wander looks like ±1 mL/min of fake flow; over 120 s it's ±0.25. Those measured numbers (the *noise profile*) are built into every weight uncertainty, so a disagreement or a stop is declared only when it clearly exceeds what the scale does at rest. **Measure scale noise** re-measures the level at the venue in 3 minutes.
+3. **The fast sensor alarms, the slow sensor confirms.** After 8 s with no drops (stretched for slow drips), an alarm fires immediately. The scale then decides, using only data from **after** the stop (so a hand on the clamp can't bias it): if mass loss is clearly below half the previous rate, the stop is confirmed by both sensors; if clearly above, the optical sensor is at fault. The verdict waits until the evidence beats the measured noise by 3x.
+4. **Optical signal lost** (receiver at the ADC rail) gets the same treatment: "checking weight", then either "flow continues" or a weight-only no-flow alarm.
+5. **Auto-calibration** = slope of mass vs drop count over at least 120 s of clean data. It **locks after 3 minutes**, so a later miscount can't leak into it, and it never trains while the sensors disagree. Reset it from the sidebar.
+6. **Health gating and honesty.** Weight is ignored while the reservoir is disturbed. Optical data recorded during an identified optical fault is marked bad afterwards. "Unknown" is a legitimate answer.
 
-## Measured on the simulator (not hardware)
+## Results
 
-These numbers come from simulation, not the real rig. Collect real data and replace them in the write-up.
+**On the real rig (14 Nov):**
 
-| Scenario | Result |
-|---|---|
-| Normal flow, about 6 h simulated, noise 0.3 g and 0.6 g | 0 false alarms in simulation (real-rig numbers pending; at 1.0 g noise expect "weight unstable" flags) |
-| Clamp closed at 3 mL/min | Alarm about 7 s after the last drop, confirmed by both sensors about 16 s after the clamp |
-| Hand on the clamp shifts the hanging load by −1 to +2 g | Correct verdict in 10/10 runs per step size |
-| Beam blocked, flow continuing | "Optical sensor not detecting drops - flow continues" within about 12 s |
-| Beam dark (receiver at ADC rail), flow continuing | "Optical sensor lost - flow continues" immediately |
-| Partial clamp (3 → 1.5 mL/min) | Low-flow warning within about 7 s |
-| Reservoir bumped | Weight marked unstable at once; optical flow carries on |
-| Optical misses 25% of drops | Flagged in most runs within about 45 s. Claim a detectable miscount of about 25–30%; a 20% miss is flagged only some of the time |
-| Auto-calibration (true 18 drops/mL, nominal 20) | Converges to 17.8–18.0 drops/mL after the first clean minute |
+| What | Result |
+| --- | --- |
+| Load-cell calibration | 427.9 counts/g; returns to 0 ± 0.3 g after unloading |
+| Fast weight noise | about 0.05 g |
+| At-rest weight-flow error | ±1.08 / ±0.63 / ±0.25 / ±0.14 mL/min over 30 / 60 / 120 / 180 s windows |
+| 10.6 min at rest replayed through the engine | 0 false alarms (the old 30 s design gave false disagreements 88% of the time) |
+| Optical drop pulse | about 600–700 counts against 1–1.5 counts of noise (SNR about 440–830) |
+
+**Simulated with the measured noise** (20 random runs per fault):
+
+| Fault | Correct | Wrong | Typical time after the fault |
+| --- | --- | --- | --- |
+| Clamp closed, 6 mL/min | 20/20 | 0 | 37 s |
+| Clamp closed, 3 mL/min | 19/20 (1 still undecided at 150 s) | 0 | 76 s |
+| Optical blocked, flow continuing, 6 mL/min | 20/20 | 0 | 28 s |
+| Optical blocked, flow continuing, 3 mL/min | 18/20 (2 still undecided at 150 s) | 0 | 69 s |
+| Normal flow, 2 h | no false findings | — | — |
+
+The "drops stopped" alarm itself is always immediate (about 8 s). **Run the demo at about 6 mL/min (about 2 drops/s):** confirmations are about twice as fast as at 3 mL/min.
+
+**Detectable miscount:** about 25% of drops missed, flagged about 2 minutes after onset. Smaller miscounts hide inside the scale's noise.
 
 ## Collecting real evidence
 
@@ -80,6 +91,12 @@ These numbers come from simulation, not the real rig. Collect real data and repl
 **If Gemini fails** (no key, no network, quota), an offline summary built from the same facts appears instead, labelled as such. Models are tried in order (`gemini-3.5-flash`, `gemini-3.1-flash-lite`, `gemini-2.5-flash`), and the first that answers is remembered. Model IDs change often; type a different one in the sidebar if needed.
 
 **For the Devpost write-up:** describe this as Gemini as the explanation layer over a deterministic, sensor-fusion diagnosis. The AI never decides anything safety-related; it makes the device's reasoning readable.
+
+## Before judging: 3 settings
+
+1. In the Serial Monitor (before starting the dashboard), send `win 120` once. It's saved in flash and makes the board's own weight flow (OLED standalone mode) use 120 s.
+2. In the dashboard: clamp closed, reservoir hanging, nobody touching the table → **Measure scale noise (3 min)**. The result is saved to `noise_profile.json`.
+3. Let normal flow run for at least 3 minutes so auto-calibration locks before showing faults.
 
 ## Device screen
 
